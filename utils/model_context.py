@@ -90,7 +90,10 @@ class ModelContext:
 
         # Calculate allocations
         content_tokens = int(total_tokens * content_ratio)
-        response_tokens = reserved_for_response or int(total_tokens * response_ratio)
+        if reserved_for_response is not None:
+            response_tokens = reserved_for_response
+        else:
+            response_tokens = int(total_tokens * response_ratio)
 
         # Sub-allocations within content budget
         file_tokens = int(content_tokens * file_ratio)
