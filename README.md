@@ -108,7 +108,16 @@ The final implementation resulted in a 26% improvement in JSON parsing performan
 git clone https://github.com/BeehiveInnovations/zen-mcp-server.git
 cd zen-mcp-server
 
-# One-command setup (includes Redis for AI conversations)
+# Beginner-friendly CLI
+python zen_cli.py menu    # interactive menu for setup/start/stop/status
+
+# Or run individual commands
+python zen_cli.py setup   # prompts for API keys and creates .env
+python zen_cli.py start   # builds images and starts services
+python zen_cli.py status  # shows running containers
+python zen_cli.py stop    # stops services
+
+# Or run the setup script directly
 ./setup-docker.sh
 ```
 
