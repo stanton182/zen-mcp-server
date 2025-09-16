@@ -65,6 +65,29 @@ class TestModelProviderRegistry:
         assert ProviderType.GOOGLE in providers
         assert ProviderType.OPENAI in providers
 
+    @patch.dict(
+        os.environ,
+        {
+            "GEMINI_API_KEY": "test-gemini",
+            "OPENAI_API_KEY": "test-openai",
+        },
+    )
+    def test_get_available_models(self):
+        """Test mapping of models to providers when API keys are configured"""
+        ModelProviderRegistry.register_provider(ProviderType.GOOGLE, GeminiModelProvider)
+        ModelProviderRegistry.register_provider(ProviderType.OPENAI, OpenAIModelProvider)
+
+        models = ModelProviderRegistry.get_available_models()
+
+        assert models["gemini-2.5-flash-preview-05-20"] == ProviderType.GOOGLE
+        assert models["gemini-2.5-pro-preview-06-05"] == ProviderType.GOOGLE
+        # Gemini also exposes shorthand aliases that should be included
+        assert models["flash"] == ProviderType.GOOGLE
+        assert models["pro"] == ProviderType.GOOGLE
+
+        assert models["o3"] == ProviderType.OPENAI
+        assert models["o3-mini"] == ProviderType.OPENAI
+
 
 class TestGeminiProvider:
     """Test Gemini model provider"""

@@ -93,16 +93,37 @@ class ModelProviderRegistry:
         Returns:
             Dict mapping model names to provider types
         """
-        models = {}
+        models: dict[str, ProviderType] = {}
 
-        for provider_type in cls._providers:
+        for provider_type, provider_class in cls._providers.items():
             provider = cls.get_provider(provider_type)
-            if provider:
-                # This assumes providers have a method to list supported models
-                # We'll need to add this to the interface
-                pass
+            if not provider:
+                # Skip providers without valid API keys/configuration
+                continue
 
-        return models
+            supported_models = getattr(provider_class, "SUPPORTED_MODELS", None)
+
+            if isinstance(supported_models, dict):
+                for model_name, details in supported_models.items():
+                    # Include the key itself if it is a valid model/alias
+                    if provider.validate_model_name(model_name):
+                        models[model_name] = provider_type
+
+                    # Some providers (e.g., Gemini) expose shorthand aliases whose
+                    # values point to canonical model names. Ensure those canonical
+                    # names are included as well when they are valid.
+                    if isinstance(details, str) and provider.validate_model_name(details):
+                        models.setdefault(details, provider_type)
+            else:
+                # Fallback: if provider exposes a method to list models, use it
+                list_method = getattr(provider, "list_supported_models", None)
+                if callable(list_method):
+                    for model_name in list_method():
+                        if provider.validate_model_name(model_name):
+                            models[model_name] = provider_type
+
+        # Return a deterministic ordering for easier testing/debugging
+        return dict(sorted(models.items()))
 
     @classmethod
     def _get_api_key_for_provider(cls, provider_type: ProviderType) -> Optional[str]:
