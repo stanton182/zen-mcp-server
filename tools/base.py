@@ -22,7 +22,7 @@ from typing import Any, Literal, Optional
 from mcp.types import TextContent
 from pydantic import BaseModel, Field
 
-from config import MAX_CONTEXT_TOKENS, MCP_PROMPT_SIZE_LIMIT
+from config import MAX_CONTENT_TOKENS, MAX_CONTEXT_TOKENS, MCP_PROMPT_SIZE_LIMIT
 from providers import ModelProvider, ModelProviderRegistry
 from utils import check_token_limit
 from utils.conversation_memory import (
@@ -332,76 +332,15 @@ class BaseTool(ABC):
             args_to_use = arguments or getattr(self, "_current_arguments", {})
             remaining_budget = args_to_use.get("_remaining_tokens")
 
-        # Use remaining budget if provided, otherwise fall back to max_tokens or model-specific default
-        if remaining_budget is not None:
-            effective_max_tokens = remaining_budget - reserve_tokens
-        elif max_tokens is not None:
-            effective_max_tokens = max_tokens - reserve_tokens
-        else:
-            # Get model-specific limits
-            # First check if model_context was passed from server.py
-            model_context = None
-            if arguments:
-                model_context = arguments.get("_model_context") or getattr(self, "_current_arguments", {}).get(
-                    "_model_context"
-                )
-
-            if model_context:
-                # Use the passed model context
-                try:
-                    token_allocation = model_context.calculate_token_allocation()
-                    effective_max_tokens = token_allocation.file_tokens - reserve_tokens
-                    logger.debug(
-                        f"[FILES] {self.name}: Using passed model context for {model_context.model_name}: "
-                        f"{token_allocation.file_tokens:,} file tokens from {token_allocation.total_tokens:,} total"
-                    )
-                except Exception as e:
-                    logger.warning(f"[FILES] {self.name}: Error using passed model context: {e}")
-                    # Fall through to manual calculation
-                    model_context = None
-
-            if not model_context:
-                # Manual calculation as fallback
-                from config import DEFAULT_MODEL
-
-                model_name = getattr(self, "_current_model_name", None) or DEFAULT_MODEL
-                try:
-                    provider = self.get_model_provider(model_name)
-                    capabilities = provider.get_capabilities(model_name)
-
-                    # Calculate content allocation based on model capacity
-                    if capabilities.max_tokens < 300_000:
-                        # Smaller context models: 60% content, 40% response
-                        model_content_tokens = int(capabilities.max_tokens * 0.6)
-                    else:
-                        # Larger context models: 80% content, 20% response
-                        model_content_tokens = int(capabilities.max_tokens * 0.8)
-
-                    effective_max_tokens = model_content_tokens - reserve_tokens
-                    logger.debug(
-                        f"[FILES] {self.name}: Using model-specific limit for {model_name}: "
-                        f"{model_content_tokens:,} content tokens from {capabilities.max_tokens:,} total"
-                    )
-                except (ValueError, AttributeError) as e:
-                    # Handle specific errors: provider not found, model not supported, missing attributes
-                    logger.warning(
-                        f"[FILES] {self.name}: Could not get model capabilities for {model_name}: {type(e).__name__}: {e}"
-                    )
-                    # Fall back to conservative default for safety
-                    from config import MAX_CONTENT_TOKENS
-
-                    effective_max_tokens = min(MAX_CONTENT_TOKENS, 100_000) - reserve_tokens
-                except Exception as e:
-                    # Catch any other unexpected errors
-                    logger.error(
-                        f"[FILES] {self.name}: Unexpected error getting model capabilities: {type(e).__name__}: {e}"
-                    )
-                    from config import MAX_CONTENT_TOKENS
-
-                    effective_max_tokens = min(MAX_CONTENT_TOKENS, 100_000) - reserve_tokens
-
-        # Ensure we have a reasonable minimum budget
-        effective_max_tokens = max(1000, effective_max_tokens)
+        effective_max_tokens, budget_source = self._calculate_file_token_budget(
+            remaining_budget=remaining_budget,
+            max_tokens=max_tokens,
+            reserve_tokens=reserve_tokens,
+            arguments=arguments,
+        )
+        logger.debug(
+            f"[FILES] {self.name}: Computed {effective_max_tokens:,} token budget for new files using {budget_source}"
+        )
 
         files_to_embed = self.filter_new_files(request_files, continuation_id)
         logger.debug(f"[FILES] {self.name}: Will embed {len(files_to_embed)} files after filtering")
@@ -419,6 +358,28 @@ class BaseTool(ABC):
         content_parts = []
 
         # Read content of new files only
+        if files_to_embed and effective_max_tokens <= 0:
+            logger.warning(
+                f"[FILES] {self.name}: No token budget available to embed {len(files_to_embed)} new file(s)."
+            )
+            logger.debug(
+                f"[FILES] {self.name}: reserve_tokens={reserve_tokens:,}, requested_remaining={remaining_budget}"
+            )
+            skipped_note_lines = [
+                "--- NOTE: Files skipped due to exhausted token budget ---",
+                (
+                    "The remaining token budget for this conversation is fully reserved for the response, "
+                    "so the following file(s) could not be embedded in-line:"
+                ),
+                "\n".join(f"  - {path}" for path in files_to_embed),
+                (
+                    "If you still need their contents, restart the conversation or request a smaller subset of files."
+                ),
+                "--- END NOTE ---",
+            ]
+            content_parts.append("\n".join(skipped_note_lines))
+            files_to_embed = []
+
         if files_to_embed:
             logger.debug(f"{self.name} tool embedding {len(files_to_embed)} new files: {', '.join(files_to_embed)}")
             logger.debug(
@@ -470,6 +431,90 @@ class BaseTool(ABC):
         result = "".join(content_parts) if content_parts else ""
         logger.debug(f"[FILES] {self.name}: _prepare_file_content_for_prompt returning {len(result)} chars")
         return result
+
+    def _calculate_file_token_budget(
+        self,
+        *,
+        remaining_budget: Optional[int],
+        max_tokens: Optional[int],
+        reserve_tokens: int,
+        arguments: Optional[dict],
+    ) -> tuple[int, str]:
+        """Calculate the available token budget for embedding files.
+
+        The previous implementation mixed several code paths and always enforced
+        a hard minimum of 1,000 tokens. That behaviour could silently exceed the
+        real conversation budget when only a few tokens remained (for example
+        during long follow-up threads). This helper normalises the calculation and
+        ensures we never request more tokens than are genuinely available.
+
+        Args:
+            remaining_budget: Tokens remaining after conversation history was added.
+            max_tokens: Optional explicit max token value passed by the caller.
+            reserve_tokens: Tokens to hold back for system instructions and
+                response generation.
+            arguments: Raw arguments passed to ``execute`` for additional context.
+
+        Returns:
+            A tuple of ``(available_tokens, source_description)``. The token
+            count is always non-negative.
+        """
+
+        logger = logging.getLogger(f"tools.{self.name}")
+
+        if remaining_budget is not None:
+            available = max(0, remaining_budget - reserve_tokens)
+            return available, "remaining conversation budget"
+
+        if max_tokens is not None:
+            available = max(0, max_tokens - reserve_tokens)
+            return available, "explicit max_tokens hint"
+
+        # Inspect any model context that server.py may have attached. Using the
+        # context keeps file allocation aligned with the precise model budgets.
+        args_to_use = arguments or getattr(self, "_current_arguments", {})
+        model_context = args_to_use.get("_model_context") if isinstance(args_to_use, dict) else None
+        if model_context is None:
+            model_context = getattr(self, "_current_arguments", {}).get("_model_context")
+
+        if model_context is not None:
+            try:
+                token_allocation = model_context.calculate_token_allocation()
+                available = max(0, token_allocation.file_tokens - reserve_tokens)
+                return available, f"model context for {getattr(model_context, 'model_name', 'unknown model')}"
+            except Exception as exc:  # noqa: BLE001 - Provide detailed context upstream
+                logger.warning(
+                    f"[FILES] {self.name}: Unable to use model context for token budget calculation: {exc}"
+                )
+
+        # Fall back to model capabilities for the currently selected model.
+        from config import DEFAULT_MODEL
+
+        model_name = getattr(self, "_current_model_name", None) or DEFAULT_MODEL
+        try:
+            provider = self.get_model_provider(model_name)
+            capabilities = provider.get_capabilities(model_name)
+
+            if capabilities.max_tokens < 300_000:
+                # Smaller models dedicate a larger share to the response.
+                model_content_tokens = int(capabilities.max_tokens * 0.6)
+            else:
+                model_content_tokens = int(capabilities.max_tokens * 0.8)
+
+            available = max(0, model_content_tokens - reserve_tokens)
+            return available, f"capabilities for {model_name}"
+        except (ValueError, AttributeError) as exc:
+            logger.warning(
+                f"[FILES] {self.name}: Could not determine capabilities for {model_name}: {type(exc).__name__}: {exc}"
+            )
+        except Exception as exc:  # noqa: BLE001 - catch unexpected provider errors
+            logger.error(
+                f"[FILES] {self.name}: Unexpected error retrieving provider capabilities for {model_name}: {exc}"
+            )
+
+        # Conservative fallback: use a safe subset of the global content limit.
+        fallback_budget = max(0, min(MAX_CONTENT_TOKENS, 100_000) - reserve_tokens)
+        return fallback_budget, "fallback token budget"
 
     def get_websearch_instruction(self, use_websearch: bool, tool_specific: Optional[str] = None) -> str:
         """

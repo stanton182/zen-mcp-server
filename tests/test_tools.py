@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tests.mock_helpers import create_mock_provider
-from tools import AnalyzeTool, ChatTool, CodeReviewTool, DebugIssueTool, ThinkDeepTool
+from tools import AnalyzeTool, ChatTool, CodeReviewTool, DebugIssueTool, Precommit, ThinkDeepTool
 
 
 class TestThinkDeepTool:
@@ -198,6 +198,31 @@ class TestAnalyzeTool:
         assert "Architecture analysis" in result[0].text
         assert "Next Steps:" in result[0].text
         assert "Architecture analysis" in result[0].text
+
+
+class TestFileTokenBudget:
+    """Tests for file token budget management in the base tool."""
+
+    def test_prepare_file_content_handles_insufficient_budget(self, tmp_path):
+        """When the budget is exhausted the tool should skip embedding files."""
+
+        tool = Precommit()
+        sample_file = tmp_path / "exhausted.py"
+        sample_file.write_text("print('still accessible context')\n" * 5, encoding="utf-8")
+
+        content = tool._prepare_file_content_for_prompt(
+            [str(sample_file)],
+            continuation_id=None,
+            context_description="Test",  # description only for logging
+            reserve_tokens=1_000,
+            remaining_budget=500,  # Less than reserve -> no room left
+        )
+
+        assert "Files skipped due to exhausted token budget" in content
+        # The raw file contents should not be embedded when the budget is 0
+        assert "still accessible context" not in content
+        # The file name should be listed to keep the assistant aware of the skip
+        assert "exhausted.py" in content
 
 
 class TestAbsolutePathValidation:
