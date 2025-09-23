@@ -23,7 +23,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server import Server
@@ -31,13 +31,7 @@ from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import ServerCapabilities, TextContent, Tool, ToolsCapability
 
-from config import (
-    DEFAULT_MODEL,
-    MAX_CONTEXT_TOKENS,
-    __author__,
-    __updated__,
-    __version__,
-)
+from config import DEFAULT_MODEL, MAX_CONTEXT_TOKENS, __author__, __updated__, __version__
 from tools import (
     AnalyzeTool,
     ChatTool,
@@ -51,6 +45,9 @@ from tools.models import ToolOutput
 # Configure logging for server operations
 # Can be controlled via LOG_LEVEL environment variable (DEBUG, INFO, WARNING, ERROR)
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Record the precise start time of the server process for diagnostics and uptime reporting
+SERVER_START_TIME = datetime.now(timezone.utc)
 
 # Create timezone-aware formatter
 
@@ -482,6 +479,7 @@ async def handle_get_version() -> list[TextContent]:
     from config import DEFAULT_THINKING_MODE_THINKDEEP
 
     # Gather comprehensive server information
+    uptime = datetime.now(timezone.utc) - SERVER_START_TIME
     version_info = {
         "version": __version__,
         "updated": __updated__,
@@ -490,7 +488,8 @@ async def handle_get_version() -> list[TextContent]:
         "default_thinking_mode_thinkdeep": DEFAULT_THINKING_MODE_THINKDEEP,
         "max_context_tokens": f"{MAX_CONTEXT_TOKENS:,}",
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        "server_started": datetime.now().isoformat(),
+        "server_started": SERVER_START_TIME.astimezone().isoformat(),
+        "uptime_seconds": int(uptime.total_seconds()),
         "available_tools": list(TOOLS.keys()) + ["get_version"],
     }
 
@@ -505,6 +504,7 @@ Configuration:
 - Max Context: {MAX_CONTEXT_TOKENS:,} tokens
 - Python: {version_info["python_version"]}
 - Started: {version_info["server_started"]}
+- Uptime: {version_info["uptime_seconds"]} seconds
 
 Available Tools:
 {chr(10).join(f"  - {tool}" for tool in version_info["available_tools"])}
